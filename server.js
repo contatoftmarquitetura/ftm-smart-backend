@@ -52,15 +52,45 @@ app.get('/', (req, res) => {
   res.json({ status: 'FTM Smart API online', version: '1.0.0' });
 });
 
-// Buscar dispositivos
+// Buscar dispositivos — tenta 3 endpoints em sequência
 app.get('/api/devices', async (req, res) => {
   try {
     const token = await getToken();
-    let result = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
-    if (!result.success || !result.result?.devices?.length) {
-      result = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
+    let devices = [];
+
+    // Endpoint 1: dispositivos associados via SmartLife
+    try {
+      const r1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
+      if (r1.success && r1.result?.devices?.length) {
+        devices = r1.result.devices;
+      }
+    } catch(e) {}
+
+    // Endpoint 2: busca por IDs fixos da conta (dispositivos visíveis na plataforma)
+    if (!devices.length) {
+      const knownIds = [
+        'eb4ad3bf5249d492e5onnq',  // Air Conditioner
+        'ebff2ff593e151d4b831os',  // Controle IR + RF433
+        'ebfbd7551f63cf95635nzm',  // Led Teto
+        'eb3036aa0c8917d7f22pd9',  // Cozinha
+        'eb5c8051a149084d5c8uhf',  // Led Painel
+        'eb95b69a116ad4c19dl9rx'   // Interruptor Escritório
+      ];
+      const results = await Promise.allSettled(
+        knownIds.map(id => tuyaRequest(token, 'GET', `/v1.0/devices/${id}`))
+      );
+      devices = results
+        .filter(r => r.status === 'fulfilled' && r.value?.success)
+        .map(r => r.value.result);
     }
-    res.json(result);
+
+    // Endpoint 3: listagem geral
+    if (!devices.length) {
+      const r3 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
+      if (r3.success) devices = r3.result?.list || (Array.isArray(r3.result) ? r3.result : []);
+    }
+
+    res.json({ success: true, result: { devices } });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
