@@ -6,31 +6,52 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-const CLIENT_ID = process.env.TUYA_CLIENT_ID || 'e8rtr5mjakwy3k5dwder';
-const CLIENT_SECRET = process.env.TUYA_CLIENT_SECRET || '687851a4738047d98c1df4c41ee88232';
+const CLIENT_ID = 'e8rtr5mjakwy3k5dwder';
+const CLIENT_SECRET = '687851a4738047d98c1df4c41ee88232';
 const BASE_URL = 'https://openapi.tuyaus.com';
 
 app.use(cors());
 app.use(express.json());
 
-function hmac(secret, message) {
+function hmac256(secret, message) {
   return crypto.createHmac('sha256', secret).update(message).digest('hex').toUpperCase();
+}
+
+function sha256(content) {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+// Assinatura correta conforme documentação Tuya v1.0
+function buildSign(clientId, secret, t, token, method, path, body) {
+  const contentHash = sha256(body ? JSON.stringify(body) : '');
+  const stringToSign = [method, contentHash, '', path].join('\n');
+  const signStr = token
+    ? clientId + token + t + stringToSign
+    : clientId + t + stringToSign;
+  return hmac256(secret, signStr);
 }
 
 async function getToken() {
   const t = Date.now().toString();
-  const sign = hmac(CLIENT_SECRET, CLIENT_ID + t);
-  const res = await fetch(`${BASE_URL}/v1.0/token?grant_type=1`, {
-    headers: { 'client_id': CLIENT_ID, 't': t, 'sign': sign, 'sign_method': 'HMAC-SHA256' }
+  const path = '/v1.0/token?grant_type=1';
+  const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, '', 'GET', path, null);
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: {
+      'client_id': CLIENT_ID,
+      't': t,
+      'sign': sign,
+      'sign_method': 'HMAC-SHA256',
+      'mode': 'cors'
+    }
   });
   const data = await res.json();
-  if (!data.success) throw new Error(data.msg || 'Auth failed: ' + JSON.stringify(data));
+  if (!data.success) throw new Error('Auth failed: ' + JSON.stringify(data));
   return data.result.access_token;
 }
 
 async function tuyaRequest(token, method, path, body = null) {
   const t = Date.now().toString();
-  const sign = hmac(CLIENT_SECRET, CLIENT_ID + token + t);
+  const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, token, method, path.split('?')[0], body);
   const opts = {
     method,
     headers: {
@@ -48,56 +69,46 @@ async function tuyaRequest(token, method, path, body = null) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'FTM Smart API online', version: '2.0.0' });
+  res.json({ status: 'FTM Smart API online', version: '3.0.0' });
 });
 
-// DEBUG — mostra resposta crua de cada endpoint
+// Debug completo
 app.get('/api/debug', async (req, res) => {
+  const out = {};
   try {
     const token = await getToken();
-    const results = {};
+    out.token = token.slice(0, 12) + '...';
+    out.token_ok = true;
 
-    results.token_ok = true;
-
-    // Testa endpoint 1
     try {
-      results.ep1_associated = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
-    } catch(e) { results.ep1_error = e.message; }
+      out.ep1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
+    } catch(e) { out.ep1_err = e.message; }
 
-    // Testa endpoint 2 — listagem geral
     try {
-      results.ep2_list = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
-    } catch(e) { results.ep2_error = e.message; }
+      out.ep2 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
+    } catch(e) { out.ep2_err = e.message; }
 
-    // Testa endpoint 3 — por UID do usuário
     try {
-      results.ep3_uid = await tuyaRequest(token, 'GET', '/v1.0/users?page_no=1&page_size=10');
-    } catch(e) { results.ep3_error = e.message; }
+      out.ep3 = await tuyaRequest(token, 'GET', '/v1.0/devices/eb4ad3bf5249d492e5onnq');
+    } catch(e) { out.ep3_err = e.message; }
 
-    // Testa dispositivo específico
-    try {
-      results.ep4_device = await tuyaRequest(token, 'GET', '/v1.0/devices/eb4ad3bf5249d492e5onnq');
-    } catch(e) { results.ep4_error = e.message; }
-
-    res.json(results);
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    out.token_err = e.message;
   }
+  res.json(out);
 });
 
-// Buscar dispositivos
+// Dispositivos
 app.get('/api/devices', async (req, res) => {
   try {
     const token = await getToken();
     let devices = [];
 
-    // Endpoint 1
     try {
       const r1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
       if (r1.success && r1.result?.devices?.length) devices = r1.result.devices;
     } catch(e) {}
 
-    // Endpoint 2 — IDs fixos
     if (!devices.length) {
       const ids = [
         'eb4ad3bf5249d492e5onnq',
@@ -115,7 +126,6 @@ app.get('/api/devices', async (req, res) => {
         .map(r => r.value.result);
     }
 
-    // Endpoint 3 — listagem geral
     if (!devices.length) {
       const r3 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
       if (r3.success) devices = r3.result?.list || (Array.isArray(r3.result) ? r3.result : []);
@@ -143,11 +153,4 @@ app.post('/api/devices/:id/commands', async (req, res) => {
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.get('/api/token', async (req, res) => {
-  try {
-    const token = await getToken();
-    res.json({ success: true, token: token.slice(0,10) + '...' });
-  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
-});
-
-app.listen(PORT, () => console.log(`FTM Smart Backend v2 porta ${PORT}`));
+app.listen(PORT, () => console.log(`FTM Smart v3 porta ${PORT}`));
