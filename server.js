@@ -24,7 +24,7 @@ async function getToken() {
     headers: { 'client_id': CLIENT_ID, 't': t, 'sign': sign, 'sign_method': 'HMAC-SHA256' }
   });
   const data = await res.json();
-  if (!data.success) throw new Error(data.msg || 'Auth failed');
+  if (!data.success) throw new Error(data.msg || 'Auth failed: ' + JSON.stringify(data));
   return data.result.access_token;
 }
 
@@ -47,98 +47,107 @@ async function tuyaRequest(token, method, path, body = null) {
   return res.json();
 }
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'FTM Smart API online', version: '1.0.0' });
+  res.json({ status: 'FTM Smart API online', version: '2.0.0' });
 });
 
-// Buscar dispositivos — tenta 3 endpoints em sequência
+// DEBUG — mostra resposta crua de cada endpoint
+app.get('/api/debug', async (req, res) => {
+  try {
+    const token = await getToken();
+    const results = {};
+
+    results.token_ok = true;
+
+    // Testa endpoint 1
+    try {
+      results.ep1_associated = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
+    } catch(e) { results.ep1_error = e.message; }
+
+    // Testa endpoint 2 — listagem geral
+    try {
+      results.ep2_list = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
+    } catch(e) { results.ep2_error = e.message; }
+
+    // Testa endpoint 3 — por UID do usuário
+    try {
+      results.ep3_uid = await tuyaRequest(token, 'GET', '/v1.0/users?page_no=1&page_size=10');
+    } catch(e) { results.ep3_error = e.message; }
+
+    // Testa dispositivo específico
+    try {
+      results.ep4_device = await tuyaRequest(token, 'GET', '/v1.0/devices/eb4ad3bf5249d492e5onnq');
+    } catch(e) { results.ep4_error = e.message; }
+
+    res.json(results);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Buscar dispositivos
 app.get('/api/devices', async (req, res) => {
   try {
     const token = await getToken();
     let devices = [];
 
-    // Endpoint 1: dispositivos associados via SmartLife
+    // Endpoint 1
     try {
       const r1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
-      if (r1.success && r1.result?.devices?.length) {
-        devices = r1.result.devices;
-      }
+      if (r1.success && r1.result?.devices?.length) devices = r1.result.devices;
     } catch(e) {}
 
-    // Endpoint 2: busca por IDs fixos da conta (dispositivos visíveis na plataforma)
+    // Endpoint 2 — IDs fixos
     if (!devices.length) {
-      const knownIds = [
-        'eb4ad3bf5249d492e5onnq',  // Air Conditioner
-        'ebff2ff593e151d4b831os',  // Controle IR + RF433
-        'ebfbd7551f63cf95635nzm',  // Led Teto
-        'eb3036aa0c8917d7f22pd9',  // Cozinha
-        'eb5c8051a149084d5c8uhf',  // Led Painel
-        'eb95b69a116ad4c19dl9rx'   // Interruptor Escritório
+      const ids = [
+        'eb4ad3bf5249d492e5onnq',
+        'ebff2ff593e151d4b831os',
+        'ebfbd7551f63cf95635nzm',
+        'eb3036aa0c8917d7f22pd9',
+        'eb5c8051a149084d5c8uhf',
+        'eb95b69a116ad4c19dl9rx'
       ];
       const results = await Promise.allSettled(
-        knownIds.map(id => tuyaRequest(token, 'GET', `/v1.0/devices/${id}`))
+        ids.map(id => tuyaRequest(token, 'GET', `/v1.0/devices/${id}`))
       );
       devices = results
-        .filter(r => r.status === 'fulfilled' && r.value?.success)
+        .filter(r => r.status === 'fulfilled' && r.value?.success && r.value?.result)
         .map(r => r.value.result);
     }
 
-    // Endpoint 3: listagem geral
+    // Endpoint 3 — listagem geral
     if (!devices.length) {
       const r3 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
       if (r3.success) devices = r3.result?.list || (Array.isArray(r3.result) ? r3.result : []);
     }
 
-    res.json({ success: true, result: { devices } });
-  } catch (e) {
+    res.json({ success: true, result: { devices }, count: devices.length });
+  } catch(e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Status de um dispositivo
 app.get('/api/devices/:id/status', async (req, res) => {
   try {
     const token = await getToken();
     const result = await tuyaRequest(token, 'GET', `/v1.0/devices/${req.params.id}/status`);
     res.json(result);
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// Controlar dispositivo (ligar/desligar)
 app.post('/api/devices/:id/commands', async (req, res) => {
   try {
     const token = await getToken();
     const result = await tuyaRequest(token, 'POST', `/v1.0/devices/${req.params.id}/commands`, req.body);
     res.json(result);
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// Buscar cenas
-app.get('/api/scenes', async (req, res) => {
-  try {
-    const token = await getToken();
-    const result = await tuyaRequest(token, 'GET', '/v1.0/homes/scenes?page_size=20');
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Token (para debug)
 app.get('/api/token', async (req, res) => {
   try {
     const token = await getToken();
-    res.json({ success: true, token: token.slice(0, 10) + '...' });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+    res.json({ success: true, token: token.slice(0,10) + '...' });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.listen(PORT, () => {
-  console.log(`FTM Smart Backend rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`FTM Smart Backend v2 porta ${PORT}`));
