@@ -108,5 +108,5 @@ app.post('/api/devices/:id/commands', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, function() { console.log('FTM Smart v13 porta ' + PORT); });
