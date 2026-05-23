@@ -16,18 +16,13 @@ app.use(express.json());
 function hmac256(secret, message) {
   return crypto.createHmac('sha256', secret).update(message).digest('hex').toUpperCase();
 }
-
 function sha256(content) {
-  return crypto.createHash('sha256').update(content).digest('hex');
+  return crypto.createHash('sha256').update(content || '').digest('hex');
 }
-
-// Assinatura correta conforme documentação Tuya v1.0
 function buildSign(clientId, secret, t, token, method, path, body) {
   const contentHash = sha256(body ? JSON.stringify(body) : '');
-  const stringToSign = [method, contentHash, '', path].join('\n');
-  const signStr = token
-    ? clientId + token + t + stringToSign
-    : clientId + t + stringToSign;
+  const stringToSign = [method, contentHash, '', path.split('?')[0]].join('\n');
+  const signStr = token ? clientId + token + t + stringToSign : clientId + t + stringToSign;
   return hmac256(secret, signStr);
 }
 
@@ -36,76 +31,99 @@ async function getToken() {
   const path = '/v1.0/token?grant_type=1';
   const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, '', 'GET', path, null);
   const res = await fetch(`${BASE_URL}${path}`, {
-    headers: {
-      'client_id': CLIENT_ID,
-      't': t,
-      'sign': sign,
-      'sign_method': 'HMAC-SHA256',
-      'mode': 'cors'
-    }
+    headers: { 'client_id': CLIENT_ID, 't': t, 'sign': sign, 'sign_method': 'HMAC-SHA256' }
   });
   const data = await res.json();
   if (!data.success) throw new Error('Auth failed: ' + JSON.stringify(data));
   return data.result.access_token;
 }
 
-async function tuyaRequest(token, method, path, body = null) {
+async function tuyaGet(token, path) {
   const t = Date.now().toString();
-  const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, token, method, path.split('?')[0], body);
-  const opts = {
-    method,
-    headers: {
-      'client_id': CLIENT_ID,
-      'access_token': token,
-      't': t,
-      'sign': sign,
-      'sign_method': 'HMAC-SHA256',
-      'Content-Type': 'application/json'
-    }
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${BASE_URL}${path}`, opts);
+  const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, token, 'GET', path, null);
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { 'client_id': CLIENT_ID, 'access_token': token, 't': t, 'sign': sign, 'sign_method': 'HMAC-SHA256' }
+  });
   return res.json();
 }
 
-app.get('/', (req, res) => {
-  res.json({ status: 'FTM Smart API online', version: '3.0.0' });
-});
+async function tuyaPost(token, path, body) {
+  const t = Date.now().toString();
+  const sign = buildSign(CLIENT_ID, CLIENT_SECRET, t, token, 'POST', path, body);
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'client_id': CLIENT_ID, 'access_token': token, 't': t, 'sign': sign, 'sign_method': 'HMAC-SHA256', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
 
-// Debug completo
-app.get('/api/debug', async (req, res) => {
-  const out = {};
+// Health
+app.get('/', (req, res) => res.json({ status: 'FTM Smart API online', version: '4.0.0' }));
+
+// ── CASAS (Homes) ──────────────────────────────────────
+// Lista todas as casas do SmartLife
+app.get('/api/homes', async (req, res) => {
   try {
     const token = await getToken();
-    out.token = token.slice(0, 12) + '...';
-    out.token_ok = true;
-
+    // Busca o UID do usuário primeiro
+    const userRes = await tuyaGet(token, '/v1.0/iot-01/associated-users/devices?last_row_key=');
+    
+    // Tenta endpoint de homes diretamente
+    let homes = [];
     try {
-      out.ep1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
-    } catch(e) { out.ep1_err = e.message; }
+      const r = await tuyaGet(token, '/v1.0/homes?page_no=1&page_size=50');
+      if (r.success && r.result?.homes) homes = r.result.homes;
+      else if (r.success && Array.isArray(r.result)) homes = r.result;
+    } catch(e) {}
 
-    try {
-      out.ep2 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
-    } catch(e) { out.ep2_err = e.message; }
+    // Fallback: endpoint alternativo
+    if (!homes.length) {
+      try {
+        const r2 = await tuyaGet(token, '/v1.0/family?page_no=1&page_size=50');
+        if (r2.success) homes = r2.result?.families || r2.result?.homes || [];
+      } catch(e) {}
+    }
 
-    try {
-      out.ep3 = await tuyaRequest(token, 'GET', '/v1.0/devices/eb4ad3bf5249d492e5onnq');
-    } catch(e) { out.ep3_err = e.message; }
-
+    res.json({ success: true, result: { homes }, count: homes.length });
   } catch(e) {
-    out.token_err = e.message;
+    res.status(500).json({ success: false, error: e.message });
   }
-  res.json(out);
 });
 
-// Dispositivos
+// Dispositivos de uma casa específica
+app.get('/api/homes/:homeId/devices', async (req, res) => {
+  try {
+    const token = await getToken();
+    const { homeId } = req.params;
+    let devices = [];
+
+    try {
+      const r = await tuyaGet(token, `/v1.0/homes/${homeId}/devices`);
+      if (r.success) devices = r.result?.devices || r.result || [];
+    } catch(e) {}
+
+    if (!devices.length) {
+      try {
+        const r2 = await tuyaGet(token, `/v1.0/family/${homeId}/devices`);
+        if (r2.success) devices = r2.result?.devices || r2.result || [];
+      } catch(e) {}
+    }
+
+    res.json({ success: true, result: { devices }, count: devices.length });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ── DISPOSITIVOS ───────────────────────────────────────
 app.get('/api/devices', async (req, res) => {
   try {
     const token = await getToken();
     let devices = [];
 
     try {
-      const r1 = await tuyaRequest(token, 'GET', '/v1.0/iot-01/associated-users/devices?last_row_key=');
+      const r1 = await tuyaGet(token, '/v1.0/iot-01/associated-users/devices?last_row_key=');
       if (r1.success && r1.result?.devices?.length) devices = r1.result.devices;
     } catch(e) {}
 
@@ -119,16 +137,11 @@ app.get('/api/devices', async (req, res) => {
         'eb95b69a116ad4c19dl9rx'
       ];
       const results = await Promise.allSettled(
-        ids.map(id => tuyaRequest(token, 'GET', `/v1.0/devices/${id}`))
+        ids.map(id => tuyaGet(token, `/v1.0/devices/${id}`))
       );
       devices = results
         .filter(r => r.status === 'fulfilled' && r.value?.success && r.value?.result)
         .map(r => r.value.result);
-    }
-
-    if (!devices.length) {
-      const r3 = await tuyaRequest(token, 'GET', '/v1.0/devices?page_size=50');
-      if (r3.success) devices = r3.result?.list || (Array.isArray(r3.result) ? r3.result : []);
     }
 
     res.json({ success: true, result: { devices }, count: devices.length });
@@ -140,7 +153,7 @@ app.get('/api/devices', async (req, res) => {
 app.get('/api/devices/:id/status', async (req, res) => {
   try {
     const token = await getToken();
-    const result = await tuyaRequest(token, 'GET', `/v1.0/devices/${req.params.id}/status`);
+    const result = await tuyaGet(token, `/v1.0/devices/${req.params.id}/status`);
     res.json(result);
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
@@ -148,9 +161,23 @@ app.get('/api/devices/:id/status', async (req, res) => {
 app.post('/api/devices/:id/commands', async (req, res) => {
   try {
     const token = await getToken();
-    const result = await tuyaRequest(token, 'POST', `/v1.0/devices/${req.params.id}/commands`, req.body);
+    const result = await tuyaPost(token, `/v1.0/devices/${req.params.id}/commands`, req.body);
     res.json(result);
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`FTM Smart v3 porta ${PORT}`));
+// Debug
+app.get('/api/debug', async (req, res) => {
+  const out = {};
+  try {
+    const token = await getToken();
+    out.token_ok = true;
+    out.token = token.slice(0,12)+'...';
+    try { out.homes = await tuyaGet(token, '/v1.0/homes?page_no=1&page_size=50'); } catch(e) { out.homes_err = e.message; }
+    try { out.family = await tuyaGet(token, '/v1.0/family?page_no=1&page_size=50'); } catch(e) { out.family_err = e.message; }
+    try { out.devices = await tuyaGet(token, '/v1.0/iot-01/associated-users/devices?last_row_key='); } catch(e) { out.devices_err = e.message; }
+  } catch(e) { out.token_err = e.message; }
+  res.json(out);
+});
+
+app.listen(PORT, () => console.log(`FTM Smart v4 porta ${PORT}`));
